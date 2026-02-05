@@ -1,4 +1,4 @@
-# GAI-GS: Geometric Algebra Integrated Gaussian Splatting for Wireless Signal Reconstruction
+# A Geometric Algebra-Informed 3DGS Framework for Wireless Channel Prediction
 
 This repository implements a novel approach for RFID spectrum reconstruction using 3D Gaussian Splatting combined with Geometric Algebra Transformers (GATr).
 
