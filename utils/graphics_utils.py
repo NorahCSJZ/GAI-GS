@@ -35,9 +35,24 @@ def getWorld2View(R, t):
     Rt[3, 3] = 1.0
     return np.float32(Rt)
 
-def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
+def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0): # This function converts camera pose (R, t) to world->camera (View) 4x4 extrinsic matrix, normalizing global translation/scale
+    # Ensure R and t are numpy arrays
+    if isinstance(R, torch.Tensor):
+        R = R.detach().cpu().numpy()
+    # If R has extra dimensions, take first or squeeze
+    if R.ndim > 2:
+        R = R[0] if R.shape[0] == 1 else R.squeeze()
+    # Ensure R shape is (3,3)
+    if R.shape != (3, 3):
+        R = R.reshape(3, 3) if R.size == 9 else R[:3, :3]
+    
+    if isinstance(t, torch.Tensor):
+        t = t.detach().cpu().numpy()
+    if t.ndim > 1:
+        t = t.flatten()[:3]
+    
     Rt = np.zeros((4, 4))
-    Rt[:3, :3] = R.transpose(0,1)
+    Rt[:3, :3] = R.transpose()
     Rt[:3, 3] = t
     Rt[3, 3] = 1.0
 

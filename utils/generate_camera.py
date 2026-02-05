@@ -18,8 +18,8 @@ def generate_new_cam(r_d, tx, resolution=180):
     fovy = np.deg2rad(90)
 
     cam = Camera(R=rot,colmap_id=None, T=trans, FoVx=fovx, FoVy=fovy, image=None, image_name=None, uid=None,invdepthmap=None,depth_params=None )
-    cam.image_width=resolution*2
-    cam.image_height=90
+    cam.image_width = resolution*2
+    cam.image_height = 90
     
     return cam
 

@@ -36,7 +36,8 @@ def try_connect():
     try:
         conn, addr = listener.accept()
         print(f"\nConnected by {addr}")
-        conn.settimeout(None)
+        # Use a short timeout to avoid blocking training when GUI is idle
+        conn.settimeout(0.1)
     except Exception as inst:
         pass
             
@@ -55,7 +56,11 @@ def send(message_bytes, verify):
     conn.sendall(bytes(verify, 'ascii'))
 
 def receive():
-    message = read()
+    try:
+        message = read()
+    except socket.timeout:
+        # GUI idle: stop waiting so training can continue
+        raise TimeoutError("GUI receive timeout")
 
     width = message["resolution_x"]
     height = message["resolution_y"]

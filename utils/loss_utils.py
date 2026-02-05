@@ -105,3 +105,5 @@ def my_ssim(img1, img2, window_size=11, size_average=True, weights=None):
     img2 = img2 * weights
 
     return _ssim(img1, img2, window, window_size, channel, size_average)
+
+sig2mse = lambda x, y : torch.mean((x - y) ** 2)

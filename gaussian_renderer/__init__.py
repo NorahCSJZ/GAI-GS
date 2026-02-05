@@ -15,11 +15,14 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, override_features=None):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
+    
+    Args:
+        override_features: [N, 3] Pre-computed features from MappingNetwork (for wireless signal rendering)
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -80,9 +83,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
             if separate_sh:
-                dc, shs = pc.get_features_dc, pc.get_features_rest
+                dc, shs = override_features, pc.get_features_rest
             else:
-                shs = pc.get_features
+                shs = pc.get_features + override_features
     else:
         colors_precomp = override_color
 

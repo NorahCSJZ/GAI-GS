@@ -42,13 +42,22 @@ class Camera(nn.Module):
         
 
        
-
+        # Near/far planes for perspective projection (affects depth mapping and perspective matrix)
         self.zfar = 5.0
         self.znear = 0.01
 
+        # Camera translation/scale
         self.trans = trans
         self.scale = scale
 
+        # World-to-camera transform matrix
+        self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
+        # Perspective matrix
+        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
+        # World-to-camera-to-perspective transform matrix
+        self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
+        # Camera center
+        self.camera_center = self.world_view_transform.inverse()[3, :3]
 
         self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()

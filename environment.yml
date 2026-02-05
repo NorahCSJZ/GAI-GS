@@ -20,8 +20,8 @@ dependencies:
   - scipy
   - scikit-image
   - pip:
-    - submodules/diff-gaussian-rasterization
-    - submodules/simple-knn
-    - submodules/fused-ssim
+    # - submodules/diff-gaussian-rasterization
+    # - submodules/simple-knn
+    # - submodules/fused-ssim
     - opencv-python
     - joblib

@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+from math import pi
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
@@ -23,12 +24,229 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 import torch.optim as optim
 import torch.nn.functional as F
+from gatr import GATr, SelfAttentionConfig, MLPConfig
+from gatr.interface import embed_point, extract_scalar, embed_scalar, embed_pluecker_ray, extract_point, extract_pluecker_ray
+from gatr.layers.linear import EquiLinear
+from gatr.interface.translation import embed_translation
+from performer_pytorch import CrossAttention, SelfAttention, FastAttention
+from utils.general_utils import normalize_dir, try_embed_pluecker_ray, batched_gather_tokens
+from einops import rearrange, repeat
 
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
 except:
     pass
+
+
+class ResidualMLP(nn.Module):
+    """Residual MLP block with residual connection in intermediate layer"""
+    def __init__(self, dim, hidden_dim=None, dropout=0.1):
+        super().__init__()
+        hidden_dim = hidden_dim or dim * 2
+        
+        # First transform: dim -> hidden_dim
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        
+        # Second transform: hidden_dim -> dim (back to original dim for residual)
+        self.fc2 = nn.Linear(hidden_dim, dim)
+        self.ln2 = nn.LayerNorm(dim)
+        
+        # Third transform: dim -> dim (after residual connection)
+        self.fc3 = nn.Linear(dim, dim)
+        self.ln3 = nn.LayerNorm(dim)
+        
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        # First transform: expand
+        out = self.dropout(self.act(self.ln1(self.fc1(x))))  # [B, hidden_dim]
+        
+        # Second transform: compress back + residual connection in intermediate layer
+        out = self.ln2(self.fc2(out))  # [B, dim]
+        out = self.act(out + x)  # ← Residual connection here (intermediate)
+        
+        # Third transform: further processing after residual
+        out = self.dropout(self.act(self.ln3(self.fc3(out))))  # [B, dim]
+        
+        return out
+
+
+class FastAttentionRenderer(nn.Module):
+    def __init__(
+        self,
+        in_dim=4,
+        hidden_dim=500,
+        output_dim=4,
+        heads=10,
+        nb_features=256,   # Small head dim: 64/128, larger models: 128/256
+        causal=False,
+        use_input_ln=True,
+        temp_init=1   # Initial value of τ; <1 sharper, >1 smoother
+    ):
+        super().__init__()
+        assert hidden_dim % heads == 0, "hidden_dim must be divisible by heads"
+        self.h = heads
+        self.dh = hidden_dim // heads   # e.g., 500//10 = 50
+        self.hidden_dim = hidden_dim
+
+        # 1) Input normalization, prevent small variance from being absorbed
+        self.in_norm = nn.LayerNorm(in_dim) if use_input_ln else nn.Identity()
+
+        # 2) Using bias=True makes it easier to break symmetry (more stable in small variance scenarios)
+        self.qkv = nn.Linear(in_dim, 3 * hidden_dim, bias=True)
+        self.out = nn.Linear(hidden_dim, output_dim, bias=True)
+
+        # 3) FastAttention: note some versions use dim_head, others use dim_heads
+        try:
+            self.fast_attn = FastAttention(
+                dim_head=self.dh,          # If your version uses dim_heads, keep next line, delete this
+                nb_features=nb_features,
+                causal=causal
+            )
+        except TypeError:
+            self.fast_attn = FastAttention(
+                dim_heads=self.dh,         # Compatible with other signature
+                nb_features=nb_features,
+                causal=causal
+            )
+        # 4) Learnable temperature τ: implement softmax(QK^T / τ) by scaling Q/K
+        self.tau = nn.Parameter(torch.tensor(float(temp_init)))
+
+
+    def forward(self, x):
+        """
+        x: (B, N, in_dim) or (N, in_dim)
+        Returns: (B, N, output_dim)
+        """
+        if x.dim() == 2:  # (N, in_dim) → (1, N, in_dim)
+            x = x.unsqueeze(0)
+
+        # Input normalization
+        x = self.in_norm(x)
+
+        B, N, _ = x.shape
+
+        # Linear projection to Q,K,V
+        qkv = self.qkv(x)                             # (B, N, 3*hidden_dim)
+        q, k, v = qkv.chunk(3, dim=-1)               # each (B, N, hidden_dim)
+
+        # Split into multi-head
+        q = rearrange(q, 'b n (h d) -> b h n d', h=self.h)  # (B, H, N, dh)
+        k = rearrange(k, 'b n (h d) -> b h n d', h=self.h)
+        v = rearrange(v, 'b n (h d) -> b h n d', h=self.h)
+
+        # Use τ to adjust attention "sharpness": softmax(QK^T / τ)
+        # In FAVOR+, this is equivalent to dividing Q,K by sqrt(τ)
+        # clamp ensures numerical stability and τ>0
+        sqrt_tau = torch.clamp(self.tau, min=1e-4).sqrt()
+        q = q / sqrt_tau
+        k = k / sqrt_tau
+
+        # FastAttention expects (B, H, N, dh) → (B, H, N, dh)
+        out = self.fast_attn(q.contiguous(), k.contiguous(), v.contiguous())
+
+        # Merge multi-head and output
+        out = rearrange(out, 'b h n d -> b n (h d)')       # (B, N, hidden_dim)
+        out = self.out(out)                          # (B, N, output_dim)
+        return out
+
+class FiLMBlock(nn.Module):
+    def __init__(self, cond_dim, feature_dim):
+        super().__init__()
+        # MLP projects cond_dim to gamma and beta, output dimension is feature_dim
+        self.fc_gamma = nn.Linear(cond_dim, feature_dim)
+        self.fc_beta  = nn.Linear(cond_dim, feature_dim)
+    def forward(self, x, cond):
+        """
+        x: intermediate features, shape (B, feature_dim)
+        cond: condition vector (global scene vector), shape (B, cond_dim)
+        Output: features after FiLM transformation (B, feature_dim)
+        """
+        gamma = self.fc_gamma(cond)  # Generate scaling coefficient gamma
+        beta  = self.fc_beta(cond)   # Generate shift coefficient beta
+        return gamma * x + beta     # Element-wise feature scaling and shifting
+
+class GATrEncoder(nn.Module):
+    """
+    Scheme A: Neighborhood packing (no mask needed)
+
+    Inputs:
+      - rx_pts:   (B, Np, 3)       Sampling points for each path (or receive points)
+      - view_dir: (B, Np, 3)       Direction for each path, needs to be normalized
+      - geom_pts: (B, Ng, 3)       Geometry library: e.g. Tx point cloud
+
+      - sig_feats: (B, Np, D_sig)  (Optional) Signal branch features, FiLM modulated by z
+
+    Outputs:
+      - z:        (B, Np, d_mod)   Direction modulation code (MV→s readout)
+      - y:        (B, Np, D_out)   (Optional) Modulated signal prediction; returns None if sig_feats not provided
+    """
+
+    def __init__(
+        self,
+        token_dim: int = 128,    # GATr MV channel count (matches checkpoint 20251104_214548)
+        d_out: int = 1,          # Signal branch final output dimension
+        use_film: bool = True,   # Whether to use FiLM modulation
+        gatr_blocks: int = 1,    # Number of GATr stacked layers
+        term=True                 # Whether to use term
+    ):
+        super().__init__()
+        self.token_dim = token_dim
+        self.d_out = d_out
+        self.use_film = use_film
+        self.term = term
+        # GATr running on single small sequence (MV flow)
+        # Note: in_mv_channels=1 (each token has only 1 MV channel)
+        if term:
+            self.gatr = GATr(
+                in_mv_channels=2,
+                out_mv_channels=token_dim,
+                hidden_mv_channels=token_dim,
+                in_s_channels=None,          # No scalar flow
+                out_s_channels=None,
+                hidden_s_channels=16,
+                num_blocks=gatr_blocks,
+                attention=SelfAttentionConfig(),
+                mlp=MLPConfig(),
+            )
+        else:
+            self.gatr = GATr(
+                in_mv_channels=1,
+                out_mv_channels=token_dim,
+                hidden_mv_channels=token_dim,
+                in_s_channels=None,          # No scalar flow
+                out_s_channels=None,
+                hidden_s_channels=16,
+                num_blocks=gatr_blocks,
+                attention=SelfAttentionConfig(),
+                mlp=MLPConfig(),
+            )
+
+    def forward(self, pts, view, tx):
+
+        
+        view = normalize_dir(view)
+        mv_rays = try_embed_pluecker_ray(pts, view).unsqueeze(-2).contiguous()
+        if self.term:
+            mv_geom = embed_point(tx).unsqueeze(-2).contiguous()
+            mv_seq = torch.cat([mv_rays, mv_geom], dim=1).unsqueeze(0)  
+        else:
+            mv_seq = mv_rays.unsqueeze(0)
+
+
+        try:
+            mv_out, _ = self.gatr(mv_seq, scalars=None) 
+        except Exception as e:
+            print(tx.shape, pts.shape, view.shape)
+            raise Exception(f"Error in GATr: {e}")
+
+        mv_out = extract_scalar(mv_out)
+
+        return mv_out.squeeze().clone()
+
 
 class GaussianModel:
 
@@ -48,10 +266,31 @@ class GaussianModel:
         self.inverse_opacity_activation = inverse_sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize
-        self.network_fn = MappingNetwork().cuda()
+        # RFID network configuration (matches checkpoint 20251104_214548: W=128, D=8, token_dim=4)
+        tx_dim = 3        # RFID: 3D position
+        tx_multires = 10  # Use positional encoding
+        tx_is_embedded = True
+        network_D = 8
+        network_W = 128
+        network_multires_pts = 10
+        network_multires_view = 10
+        skips = [4]
+        token_dim = 4
+        
+        self.network_fn = MappingNetwork(
+            D=network_D,
+            W=network_W,
+            input_dims={'pts':3, 'view':3, 'tx':tx_dim},
+            multires={'pts':network_multires_pts, 'view':network_multires_view, 'tx':tx_multires},
+            is_embeded={'pts':True, 'view':True, 'tx':tx_is_embedded},
+            token_dim=token_dim,
+            skips=skips,
+            use_view=True,
+        ).cuda()
+        
 
 
-    def __init__(self, sh_degree, optimizer_type="default"):
+    def __init__(self, sh_degree, optimizer_type="default", data_type='rfid'):
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
@@ -67,8 +306,8 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.data_type = data_type
         self.setup_functions()
-
 
     def capture(self):
         return (
@@ -83,7 +322,6 @@ class GaussianModel:
             self.xyz_gradient_accum,
             self.denom,
             self.optimizer.state_dict(),
-            self.optimizer2.state_dict(),
             
             self.spatial_lr_scale,
         )
@@ -105,7 +343,6 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
-        self.optimizer2.load_state_dict(opt_dict)
         
 
     @property
@@ -165,10 +402,12 @@ class GaussianModel:
     #     return BasicPointCloud(points=positions, colors=colors)
     
     def gaussian_init(self):
-        # 随机生成服从高斯分布的张量
-        fused_point_cloud = torch.randn((20000,3)).float().cuda()
+        # Randomly generate tensor following Gaussian distribution
+        # RFID Spectrum: output is [360, 90] = 32400 pixels
+        num_points = 20000
+        fused_point_cloud = torch.randn((num_points,3)).float().cuda()
         fused_point_cloud = (fused_point_cloud*10)
-        fused_color = RGB2SH(torch.rand((20000,3)).float().cuda())
+        fused_color = RGB2SH(torch.rand((num_points,3)).float().cuda())
 
         # pcd = self.fetchPly()
         # fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
@@ -184,7 +423,7 @@ class GaussianModel:
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
-        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities = inverse_sigmoid(0.4 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
@@ -239,52 +478,51 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
-
         if self.optimizer_type == "default":
-            self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+            self.optimizer = torch.optim.AdamW(l, lr=0.0, eps=1e-15)
         elif self.optimizer_type == "sparse_adam":
             try:
                 self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
             except:
                 # A special version of the rasterizer is required to enable sparse adam
-                self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+                self.optimizer = torch.optim.AdamW(l, lr=0.0, eps=1e-15)
 
-        self.exposure_optimizer = torch.optim.Adam([self._exposure])
+        self.exposure_optimizer = torch.optim.AdamW([self._exposure], lr=training_args.exposure_lr_init)
 
-        self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.position_lr_final*self.spatial_lr_scale,
-                                                    lr_delay_mult=training_args.position_lr_delay_mult,
-                                                    max_steps=training_args.position_lr_max_steps)
+        # Cosine scheduler with warmup for all optimizers (using LambdaLR to avoid deprecation warning)
+        total_iters = training_args.iterations
+        warmup_iters = int(total_iters * 0.05)  # 5% warmup
         
-        self.exposure_scheduler_args = get_expon_lr_func(training_args.exposure_lr_init, training_args.exposure_lr_final,
-                                                        lr_delay_steps=training_args.exposure_lr_delay_steps,
-                                                        lr_delay_mult=training_args.exposure_lr_delay_mult,
-                                                        max_steps=training_args.iterations)
-        params_mlp = list(self.network_fn.parameters())
-
-        ''' You may need to modify the parameters here for different data sizes.'''
-        self.optimizer2 = torch.optim.Adam(params_mlp, lr=float(8e-4),
-                                          weight_decay=float(5e-5),
-                                          betas=(0.9, 0.999)) 
-        self.cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=self.optimizer2,
-                                                                        T_max=float(200000), eta_min=float(1e-6),
-                                                                        last_epoch=-1)
-
-                                                                    
-                                                                    
-                                                                    
+        import math
+        def lr_lambda(step):
+            if step < warmup_iters:
+                # Linear warmup: 0.01 -> 1.0
+                return 0.01 + 0.99 * step / warmup_iters
+            else:
+                # Cosine annealing: 1.0 -> 0.01
+                progress = (step - warmup_iters) / max(1, total_iters - warmup_iters)
+                return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
         
-    def update_learning_rate(self, iteration):
-        ''' Learning rate scheduling per step '''
-        if self.pretrained_exposures is None:
-            for param_group in self.exposure_optimizer.param_groups:
-                param_group['lr'] = self.exposure_scheduler_args(iteration)
+        # Gaussian scheduler
+        self.gaussian_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+        
+        # Exposure scheduler
+        self.exposure_scheduler = optim.lr_scheduler.LambdaLR(self.exposure_optimizer, lr_lambda=lr_lambda)
 
-        for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "xyz":
-                lr = self.xyz_scheduler_args(iteration)
-                param_group['lr'] = lr
-                return lr
+        # Create independent optimizer for network_fn
+        mlp_params = []
+        if hasattr(self, 'network_fn') and self.network_fn is not None:
+            network_lr = 5e-4  # Matches checkpoint 20251104_214548
+            mlp_params.append({'params': list(self.network_fn.parameters()), 'lr': network_lr})
+            print(f"Adding network_fn to mlp_optimizer (lr={network_lr})")
+        
+        if mlp_params:
+            self.mlp_optimizer = torch.optim.AdamW(mlp_params, lr=1e-3, weight_decay=5e-5, betas=(0.9, 0.999))
+            # MLP scheduler: LambdaLR with warmup + cosine
+            self.mlp_scheduler = optim.lr_scheduler.LambdaLR(self.mlp_optimizer, lr_lambda=lr_lambda)
+        else:
+            self.mlp_optimizer = None
+            self.mlp_scheduler = None
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -325,218 +563,6 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
 
     def load_ply(self, path, use_train_test_exp = False):
-        plydata = PlyData.read(path)
-        if use_train_test_exp:
-            exposure_file = os.path.join(os.path.dirname(path), os.pardir, os.pardir, "exposure.json")
-            if os.path.exists(exposure_file):
-                with open(exposure_file, "r") as f:
-                    exposures = json.load(f)
-                self.pretrained_exposures = {image_name: torch.FloatTensor(exposures[image_name]).requires_grad_(False).cuda() for image_name in exposures}
-                print(f"Pretrained exposures loaded.")
-            else:
-                print(f"No exposure to be loaded at {exposure_file}")
-                self.pretrained_exposures = None
-
-        xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
-                        np.asarray(plydata.elements[0]["y"]),
-                        np.asarray(plydata.elements[0]["z"])),  axis=1)
-        opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
-
-        features_dc = np.zeros((xyz.shape[0], 3, 1))
-        features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
-        features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
-        features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
-
-        extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
-        extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
-        assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
-        features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
-        for idx, attr_name in enumerate(extra_f_names):
-            features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
-        features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
-
-        scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
-        scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
-        scales = np.zeros((xyz.shape[0], len(scale_names)))
-        for idx, attr_name in enumerate(scale_names):
-            scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
-
-        rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
-        rot_names = sorted(rot_names, key = lambda x: int(x.split('_')[-1]))
-        rots = np.zeros((xyz.shape[0], len(rot_names)))
-        for idx, attr_name in enumerate(rot_names):
-            rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
-
-        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
-
-        self.active_sh_degree = self.max_sh_degree
-
-    def replace_tensor_to_optimizer(self, tensor, name):
-        optimizable_tensors = {}
-        for group in self.optimizer.param_groups:
-            if group["name"] == name:
-                stored_state = self.optimizer.state.get(group['params'][0], None)
-                stored_state["exp_avg"] = torch.zeros_like(tensor)
-                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
-
-                del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
-                self.optimizer.state[group['params'][0]] = stored_state
-
-                optimizable_tensors[group["name"]] = group["params"][0]
-        return optimizable_tensors
-
-    def _prune_optimizer(self, mask):
-        optimizable_tensors = {}
-        for group in self.optimizer.param_groups:
-            stored_state = self.optimizer.state.get(group['params'][0], None)
-            if stored_state is not None:
-                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
-                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
-
-                del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
-                self.optimizer.state[group['params'][0]] = stored_state
-
-                optimizable_tensors[group["name"]] = group["params"][0]
-            else:
-                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
-                optimizable_tensors[group["name"]] = group["params"][0]
-        return optimizable_tensors
-
-    def prune_points(self, mask):
-        valid_points_mask = ~mask
-        optimizable_tensors = self._prune_optimizer(valid_points_mask)
-
-        self._xyz = optimizable_tensors["xyz"]
-        self._features_dc = optimizable_tensors["f_dc"]
-        self._features_rest = optimizable_tensors["f_rest"]
-        self._opacity = optimizable_tensors["opacity"]
-        self._scaling = optimizable_tensors["scaling"]
-        self._rotation = optimizable_tensors["rotation"]
-
-        self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
-
-        self.denom = self.denom[valid_points_mask]
-        self.max_radii2D = self.max_radii2D[valid_points_mask]
-        self.tmp_radii = self.tmp_radii[valid_points_mask]
-
-    def cat_tensors_to_optimizer(self, tensors_dict):
-        optimizable_tensors = {}
-        for group in self.optimizer.param_groups:
-            assert len(group["params"]) == 1
-            extension_tensor = tensors_dict[group["name"]]
-            stored_state = self.optimizer.state.get(group['params'][0], None)
-            if stored_state is not None:
-
-                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
-                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
-
-                del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
-                self.optimizer.state[group['params'][0]] = stored_state
-
-                optimizable_tensors[group["name"]] = group["params"][0]
-            else:
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
-                optimizable_tensors[group["name"]] = group["params"][0]
-
-        return optimizable_tensors
-
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
-        d = {"xyz": new_xyz,
-        "f_dc": new_features_dc,
-        "f_rest": new_features_rest,
-        "opacity": new_opacities,
-        "scaling" : new_scaling,
-        "rotation" : new_rotation}
-
-        optimizable_tensors = self.cat_tensors_to_optimizer(d)
-        self._xyz = optimizable_tensors["xyz"]
-        self._features_dc = optimizable_tensors["f_dc"]
-        self._features_rest = optimizable_tensors["f_rest"]
-        self._opacity = optimizable_tensors["opacity"]
-        self._scaling = optimizable_tensors["scaling"]
-        self._rotation = optimizable_tensors["rotation"]
-
-        self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
-        n_init_points = self.get_xyz.shape[0]
-        # Extract points that satisfy the gradient condition
-        padded_grad = torch.zeros((n_init_points), device="cuda")
-        padded_grad[:grads.shape[0]] = grads.squeeze()
-        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
-
-        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
-        means =torch.zeros((stds.size(0), 3),device="cuda")
-        samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
-        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
-        new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
-        new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
-        new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
-        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
-        new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
-
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
-
-        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
-        self.prune_points(prune_filter)
-
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
-        # Extract points that satisfy the gradient condition
-        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        
-        new_xyz = self._xyz[selected_pts_mask]
-        new_features_dc = self._features_dc[selected_pts_mask]
-        new_features_rest = self._features_rest[selected_pts_mask]
-        new_opacities = self._opacity[selected_pts_mask]
-        new_scaling = self._scaling[selected_pts_mask]
-        new_rotation = self._rotation[selected_pts_mask]
-
-        new_tmp_radii = self.tmp_radii[selected_pts_mask]
-
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
-
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
-        grads = self.xyz_gradient_accum / self.denom
-        grads[grads.isnan()] = 0.0
-
-        self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
-
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
-        if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        self.prune_points(prune_mask)
-        tmp_radii = self.tmp_radii
-        self.tmp_radii = None
-
-        torch.cuda.empty_cache()
-
-    def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
-        self.denom[update_filter] += 1
-
-    def dist_signal_mapping(self, tx, r_o):
         r_o = torch.tensor(r_o).cuda()
         pts = self._xyz
         view = self._xyz - tx
@@ -559,7 +585,6 @@ class GaussianModel:
         # signal = signal*att
         signal = torch.cat((signal, signal, signal),-1)
         self._features_dc = signal.unsqueeze(-2)
-        # self._opacity = att
  
 
         
@@ -619,6 +644,24 @@ def get_embedder(multires, is_embeded=True, input_dims=3):
     embed = lambda x, eo=embedder_obj : eo.embed(x)
     return embed, embedder_obj.out_dim
 
+class DirectionalCrossAttention(nn.Module):
+    def __init__(self, input_dim1, input_dim2, dim=128, heads=4):  # heads=4 matches checkpoint
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.query_proj = nn.Linear(input_dim1, dim)
+        self.key_proj = nn.Linear(input_dim2, dim)
+        self.cross_attention = CrossAttention(dim=dim, heads=heads)
+
+    def forward(self, pts, view, cls):
+        direction = torch.cat([pts, view], dim=-1) 
+        q = self.query_proj(direction).unsqueeze(0)
+        kv = self.key_proj(cls).unsqueeze(0)
+        q_in  = q.contiguous().clone()
+        kv_in = kv.contiguous().clone()
+        attn_out = self.cross_attention(q_in, context=kv_in)
+        return attn_out.squeeze(0)
+
     
 class MappingNetwork(nn.Module):
 
@@ -626,26 +669,28 @@ class MappingNetwork(nn.Module):
                  input_dims={'pts':3, 'view':3, 'tx':3},
                  multires = {'pts':10, 'view':10, 'tx':10},
                  is_embeded={'pts':True, 'view':True, 'tx':True},
-                 attn_output_dims=2, sig_output_dims=2):
-
+                 attn_output_dims=2, sig_output_dims=2, token_dim=4,
+                 use_view=True):
         super().__init__()
         self.skips = skips
+        self.use_view = use_view
        
-        # set positional encoding function
+        # Set positional encoding function
         self.embed_pts_fn, input_pts_dim = get_embedder(multires['pts'], is_embeded['pts'], input_dims['pts'])
-        self.embed_view_fn, input_view_dim = get_embedder(multires['view'], is_embeded['view'], input_dims['view'])
         self.embed_tx_fn, input_tx_dim = get_embedder(multires['tx'], is_embeded['tx'], input_dims['tx'])
+        self.embed_view_fn, input_view_dim = get_embedder(multires['view'], is_embeded['view'], input_dims['view'])
 
-        ## attenuation network
+        ## Attenuation network
         self.attenuation_linears = nn.ModuleList(
             [nn.Linear(input_pts_dim, W)] +
             [nn.Linear(W, W) if i not in skips else nn.Linear(W + input_pts_dim, W)
              for i in range(D - 1)]
         )
 
-        ## signal network
+        ## Signal network (with view direction for RFID)
+        signal_input_dim = input_tx_dim + W + input_view_dim
         self.signal_linears = nn.ModuleList(
-            [nn.Linear(input_view_dim + input_tx_dim + W, W)] +
+            [nn.Linear(signal_input_dim, W)] +
             [nn.Linear(W, W//2)]
         )
 
@@ -653,34 +698,59 @@ class MappingNetwork(nn.Module):
         self.attenuation_output = nn.Linear(W, attn_output_dims)
         self.feature_layer = nn.Linear(W, W)
         self.signal_output = nn.Linear(W//2, sig_output_dims)
+        
+        # RFID: full structure using view
+        cls_token_dim = token_dim
+        self.cls_encoder = GATrEncoder(token_dim=cls_token_dim, gatr_blocks=1)
+        attention_heads = 4
+        input_dim1 = input_pts_dim + input_view_dim
+        self.directional_cross_attention = DirectionalCrossAttention(
+            input_dim1=input_dim1, input_dim2=cls_token_dim, dim=W, heads=attention_heads)
+        self.mlp = nn.Linear(W*2, W)
 
 
-    def forward(self, pts, view, tx):
 
+    def forward(self, pts, tx, view=None):
+        """
+        Args:
+            pts: [N, 3] Gaussian point positions
+            tx: [N, D] Condition input (RFID: position [N, 3])
+            view: [N, 3] View direction (used for RFID)
+        """
         # position encoding
-        pts = self.embed_pts_fn(pts).contiguous()
-        view = self.embed_view_fn(view).contiguous()
-        tx = self.embed_tx_fn(tx).contiguous()
-        shape = pts.shape
-        pts = pts.view(-1, list(pts.shape)[-1])
-        view = view.view(-1, list(view.shape)[-1])
-        tx = tx.view(-1, list(tx.shape)[-1])
+        pts_encoded = self.embed_pts_fn(pts).contiguous()
+        tx_encoded = self.embed_tx_fn(tx).contiguous()
+        
+        shape = pts_encoded.shape
+        pts_flat = pts_encoded.view(-1, pts_encoded.shape[-1])
+        tx_flat = tx_encoded.view(-1, tx_encoded.shape[-1])
 
-        x = pts
+        # Attenuation network (only uses pts)
+        x = pts_flat
         for i, layer in enumerate(self.attenuation_linears):
             x = F.relu(layer(x))
             if i in self.skips:
-                x = torch.cat([pts, x], -1)
+                x = torch.cat([pts_flat, x], -1)
 
-        attn = self.attenuation_output(x)    # (batch_size, 2)
-        feature = self.feature_layer(x)
-        x = torch.cat([feature, view, tx], -1)
+        attn = self.attenuation_output(x)  # [N, 2]
+        feature = self.feature_layer(x)    # [N, W]
 
+        # RFID: full structure using view
+        cls = self.cls_encoder(pts, view, tx)
+        view_encoded = self.embed_view_fn(view).contiguous()
+        view_flat = view_encoded.view(-1, view_encoded.shape[-1])
+        
+        directional_attn = self.directional_cross_attention(pts_flat, view_flat, cls)
+        feature = self.mlp(torch.cat([feature.clone(), directional_attn], -1)) + feature
+        x = torch.cat([feature, view_flat, tx_flat], -1)
+
+        # Signal network
         for i, layer in enumerate(self.signal_linears):
             x = F.relu(layer(x))
     
-        signal = self.signal_output(x)    #[batchsize, n_samples, 2]
+        signal = self.signal_output(x)  # [N, 2]
 
-        outputs = torch.cat([attn, signal], -1).contiguous()    # [batchsize, n_samples, 4]
-        return outputs.view(shape[:-1]+outputs.shape[-1:])
+        outputs = torch.cat([attn, signal], -1).contiguous()  # [N, 4]
+        outputs = outputs.view(shape[:-1] + outputs.shape[-1:])
+        return outputs
     

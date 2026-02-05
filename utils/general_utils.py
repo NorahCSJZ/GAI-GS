@@ -14,6 +14,8 @@ import sys
 from datetime import datetime
 import numpy as np
 import random
+from typing import Optional
+from gatr.interface import embed_pluecker_ray
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
@@ -131,3 +133,62 @@ def safe_state(silent):
     np.random.seed(0)
     torch.manual_seed(0)
     # torch.cuda.set_device(torch.device("cuda:0"))
+
+# -----------------------------
+# Utility functions
+# -----------------------------
+def normalize_dir(v: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Normalize direction vectors: (B, N, 3) -> (B, N, 3)"""
+    return v / (v.norm(dim=-1, keepdim=True) + eps)
+
+
+def try_embed_pluecker_ray(rx: torch.Tensor, view_dir: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    Compatible with two common signatures:
+      1) embed_pluecker_ray(rx, dir)        # each is (B, N, 3)
+      2) embed_pluecker_ray(torch.cat([...], -1))  # (B, N, 6)
+    Returns: (B, N, 16)
+    """
+    if view_dir is None:
+        # Already (B, N, 6)
+        return embed_pluecker_ray(rx)  # type: ignore
+    try:
+        return embed_pluecker_ray(rx, view_dir)  # type: ignore
+    except TypeError:
+        x6 = torch.cat([rx, view_dir], dim=-1)
+        return embed_pluecker_ray(x6)  # type: ignore
+
+
+def batched_gather_tokens(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    """
+    From x's items dimension (dim=1), select subset by idx.
+    x:   (B, Ng, C, 16)
+    idx: (B, Np, K)   -- K geometric neighbor indices for each ray
+    Returns: (B, Np, K, C, 16)
+    """
+    B, Ng, C, D16 = x.shape
+    _, Np, K = idx.shape
+
+    # Expand idx to shape (B, Np, K, C, 16) for gather
+    idx_exp = idx.unsqueeze(-1).unsqueeze(-1).expand(B, Np, K, C, D16)  # (B, Np, K, C, 16)
+
+    # Expand x to (B, 1, Ng, C, 16) for gather along dim 2 (Ng)
+    x_exp = x.unsqueeze(1).expand(B, Np, Ng, C, D16)
+
+    gathered = torch.gather(x_exp, dim=2, index=idx_exp)  # (B, Np, K, C, 16)
+    return gathered
+
+
+def knn_indices(
+    query_pts: torch.Tensor,  # (B, Np, 3) -- Rx or path sampling point coordinates
+    key_pts: torch.Tensor,    # (B, Ng, 3) -- Tx or geometry library point coordinates
+    k: int,
+) -> torch.Tensor:
+    """
+    Use Euclidean distance for KNN, returns (B, Np, K) indices.
+    """
+    # Distance: (B, Np, Ng)
+    dist = torch.cdist(query_pts, key_pts)  # Default p=2
+    # Get nearest K (topk with largest=False)
+    idx = torch.topk(dist, k=k, dim=-1, largest=False).indices  # (B, Np, K)
+    return idx
