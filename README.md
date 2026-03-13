@@ -1,4 +1,4 @@
-# GAI-GS: Geometric Algebra-Informed 3D Gaussian Splatting for Wireless Scene Representation
+# A Geometric Algebra-Informed 3D Gaussian Splatting Framework for Wireless Scene Representation Scene Representation
 
 This repository contains the official code for:
 
@@ -77,12 +77,7 @@ bash run_ddp.sh 2 --dataset_type ble
 If you find this repository useful, please cite our CVPR 2026 paper:
 
 ```bibtex
-@inproceedings{gai_gs_cvpr2026,
-  title={A Geometric Algebra-Informed 3D Gaussian Splatting Framework for Wireless Scene Representation},
-  author={To be announced},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-  year={2026}
-}
+To appear
 ```
 
 ## Acknowledgments
@@ -90,4 +85,5 @@ If you find this repository useful, please cite our CVPR 2026 paper:
 This project builds on and benefits from prior work, including:
 
 - [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting)
+- Some code snippets are borrowed from [WRF-GS+](https://github.com/wenchaozheng/WRF-GSplus/tree/main) and [Geometric-Algebra-Transformer](https://github.com/qualcomm-ai-research/geometric-algebra-transformer)
 - Project submodules under `./submodules`
