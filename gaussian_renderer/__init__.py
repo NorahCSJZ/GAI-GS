@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -16,21 +16,21 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.rigid_utils import from_homogenous, to_homogenous
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,d_xyz, d_rotation, d_scaling, d_signal, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, d_rotation, d_scaling, d_signal, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
     """
-    Render the scene. 
-    
+    Render the scene.
+
     Background tensor (bg_color) must be on GPU!
     """
- 
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     screenspace_points_densify = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
-    
+
     try:
         screenspace_points.retain_grad()
         screenspace_points_densify.retain_grad()
-        
+
     except:
         pass
 
@@ -46,7 +46,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,d
         bg=bg_color,
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,    
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
@@ -56,9 +56,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,d
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz 
-    # means3D = pc.get_xyz + d_xyz
-    
+    means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
 
@@ -88,17 +86,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,d
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
             if separate_sh:
-                dc, shs = pc.get_features_dc , pc.get_features_rest
+                dc = pc.get_features_dc + d_signal
+                shs = pc.get_features_rest
             else:
                 shs = pc.get_features + d_signal
-                # print(shs.shape)
-                # print(d_signal.shape)
-                # shs = pc.get_features
 
     else:
         colors_precomp = override_color
 
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
     if separate_sh:
         rendered_image, radii, depth_image = rasterizer(
             means3D = means3D,
@@ -120,7 +116,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,d
             scales = scales,
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
-        
+
     # Apply exposure to rendered image (training only)
     if use_trained_exp:
         exposure = pc.get_exposure_from_name(viewpoint_camera.image_name)
@@ -128,7 +124,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,d
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    rendered_image = rendered_image.clamp(0, 1)
+    # For standard visual rendering clamp to [0,1].
+    # For BLE complex signal (clamp_output=False) allow negative imaginary values.
     out = {
         "render": rendered_image,
         "viewspace_points": screenspace_points,
@@ -136,5 +133,5 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,d
         "radii": radii,
         "depth" : depth_image
         }
-    
+
     return out

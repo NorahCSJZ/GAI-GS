@@ -72,34 +72,83 @@ class PipelineParams(ParamGroup):
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
+    # Complete per-dataset hyperparameter configurations
+    DATASET_CONFIGS = {
+        'rfid': {
+            'iterations': 200_000,
+            'position_lr_init': 0.00016,
+            'position_lr_final': 0.0000016,
+            'position_lr_delay_mult': 0.01,
+            'position_lr_max_steps': 30_000,
+            'deform_lr_max_steps': 200_000,
+            'feature_lr': 0.0025,
+            'opacity_lr': 0.025,
+            'scaling_lr': 0.005,
+            'rotation_lr': 0.001,
+            'exposure_lr_init': 0.01,
+            'exposure_lr_final': 0.001,
+            'exposure_lr_delay_steps': 0,
+            'exposure_lr_delay_mult': 0.0,
+            'percent_dense': 0.01,
+            'lambda_dssim': 0.2,
+            'densification_interval': 100,
+            'opacity_reset_interval': 3000,
+            'densify_from_iter': 500,
+            'densify_until_iter': 15_000,
+            'densify_grad_threshold': 0.0002,
+            'min_opacity': 0.005,
+            'depth_l1_weight_init': 1.0,
+            'depth_l1_weight_final': 0.01,
+            'random_background': False,
+            'optimizer_type': "default",
+        },
+        'ble': {
+            # BLE2.4GHz: 1954 train samples, 1 epoch = 1954 iter.
+            # 200k iterations ~ 102 epochs.
+            'iterations': 200_000,
+            'position_lr_init': 0.0005,
+            'position_lr_final': 0.000005,
+            'position_lr_delay_mult': 0.01,
+            'position_lr_max_steps': 300_000,
+            'deform_lr_max_steps': 2_000_000,      # larger than iterations; acts as no decay
+            'feature_lr': 0.005,
+            'opacity_lr': 0.05,
+            'scaling_lr': 0.005,
+            'rotation_lr': 0.001,
+            'exposure_lr_init': 0.01,
+            'exposure_lr_final': 0.001,
+            'exposure_lr_delay_steps': 0,
+            'exposure_lr_delay_mult': 0.0,
+            'percent_dense': 0.01,
+            'lambda_dssim': 0.0,
+            'densification_interval': 1_000,       
+            'opacity_reset_interval': 30_000,      
+            'densify_from_iter': 5_000,            
+            'densify_until_iter': 50_000,         
+            'densify_grad_threshold': 0.001,
+            'min_opacity': 0.005,                  
+            'depth_l1_weight_init': 1.0,
+            'depth_l1_weight_final': 0.01,
+            'random_background': False,
+            'optimizer_type': "default",
+            'grad_accum_steps': 32,                 # effective batch size
+        },
+    }
+
     def __init__(self, parser):
-        self.iterations = 200_000
-        self.position_lr_init = 0.00016
-        self.position_lr_final = 0.0000016
-        self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 30_000
-        self.deform_lr_max_steps = 600_000
-        
-        self.feature_lr = 0.0025#0.0025
-        self.opacity_lr = 0.025
-        self.scaling_lr = 0.005
-        self.rotation_lr = 0.001
-        self.exposure_lr_init = 0.01
-        self.exposure_lr_final = 0.001
-        self.exposure_lr_delay_steps = 0
-        self.exposure_lr_delay_mult = 0.0
-        self.percent_dense = 0.01
-        self.lambda_dssim = 0.2
-        self.densification_interval = 100
-        self.opacity_reset_interval =3000
-        self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
-        self.densify_grad_threshold = 0.0002  
-        self.depth_l1_weight_init = 1.0
-        self.depth_l1_weight_final = 0.01
-        self.random_background = False
-        self.optimizer_type = "default"
+        for key, value in self.DATASET_CONFIGS['rfid'].items():
+            setattr(self, key, value)
         super().__init__(parser, "Optimization Parameters")
+    
+    @classmethod
+    def apply_dataset_config(cls, opt, dataset_type):
+        """Apply dataset-specific hyperparameter overrides."""
+        if dataset_type in cls.DATASET_CONFIGS:
+            config = cls.DATASET_CONFIGS[dataset_type]
+            for key, value in config.items():
+                if hasattr(opt, key):
+                    setattr(opt, key, value)
+        return opt
 
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]

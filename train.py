@@ -3,28 +3,37 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
-# For inquiries contact  george.drettakis@inria.fr
+# For inquiries contact george.drettakis@inria.fr
 #
 import datetime
 import os
-import torch
-import numpy as np
-from random import randint
-from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui
 import sys
-from scene import Scene, GaussianModel, DeformModel
-from utils.general_utils import safe_state, get_expon_lr_func
-from utils.generate_camera import generate_new_cam
 
-import uuid
+import numpy as np
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
-from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
+from scipy.spatial.transform import Rotation
+from skimage.metrics import structural_similarity as skimage_ssim
+
+from gaussian_renderer import render, network_gui
+from scene import Scene, GaussianModel
+from scene.deform_model import DeformModel
+from scene.dataloader import amplitude2rssi
+from utils.general_utils import safe_state
+from utils.generate_camera import generate_new_cam
+from utils.loss_utils import l1_loss, l2_loss
+from utils.logger import logger_config
+from utils.data_painter import paint_spectrum_compare
 from arguments import ModelParams, PipelineParams, OptimizationParams
+torch.manual_seed(3407)
+torch.cuda.manual_seed(3407)
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -34,358 +43,470 @@ except ImportError:
 try:
     from fused_ssim import fused_ssim
     FUSED_SSIM_AVAILABLE = True
-except:
+except ImportError:
     FUSED_SSIM_AVAILABLE = False
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
     SPARSE_ADAM_AVAILABLE = True
-except:
+except ImportError:
     SPARSE_ADAM_AVAILABLE = False
-from utils.logger import logger_config 
-from scipy.spatial.transform import Rotation
-from utils.data_painter import paint_spectrum_compare 
-from skimage.metrics import structural_similarity as ssim
+
+torch.manual_seed(3407)
 
 
+# ---------------------------------------------------------------------------
+# Distributed training helpers
+# ---------------------------------------------------------------------------
+
+def setup_ddp(rank, world_size):
+    """Initialize the DDP process group."""
+    os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', 'localhost')
+    os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '12355')
+    dist.init_process_group(backend='nccl', init_method='env://',
+                            world_size=world_size, rank=rank)
+    torch.cuda.set_device(rank)
 
 
+def cleanup_ddp():
+    """Destroy the DDP process group."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+
+def is_main_process():
+    return (not dist.is_initialized()) or dist.get_rank() == 0
+
+
+def get_rank():
+    return dist.get_rank() if dist.is_initialized() else 0
+
+
+def get_world_size():
+    return dist.get_world_size() if dist.is_initialized() else 1
+
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations,
+             checkpoint_iterations, checkpoint, debug_from, dataset_type,
+             use_ddp=False):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
-        sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
+        sys.exit("sparse_adam is not installed. "
+                 "Run: pip install [3dgs_accel].")
 
-    datadir = 'data'
+    rank = get_rank()
+    world_size = get_world_size()
+
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     logdir = os.path.join('logs', current_time)
-    log_filename = "logger.log"
-    devices = torch.device('cuda')
-    log_savepath = os.path.join(logdir, log_filename)
-    os.makedirs(logdir,exist_ok=True)
-    logger = logger_config(log_savepath=log_savepath, logging_name='gsss')
-    logger.info("datadir:%s, logdir:%s", datadir, logdir)
-    
-    first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset,current_time)
+
+    if is_main_process():
+        os.makedirs(logdir, exist_ok=True)
+        logger = logger_config(log_savepath=os.path.join(logdir, "logger.log"),
+                               logging_name='wrf_gs')
+        logger.info("logdir: %s | dataset: %s | world_size: %d",
+                    logdir, dataset_type, world_size)
+    else:
+        logger = None
+
+    tb_writer = prepare_output_and_logger(dataset, current_time) if is_main_process() else None
+
+    # ---- Model initialization ----
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    gaussians.gaussian_init()
+    init_num_points = 10000 if dataset_type == "ble" else 200000
+    gaussians.gaussian_init(num_points=init_num_points)
+
     deform = DeformModel()
+    if use_ddp:
+        deform.deform = DDP(deform.deform, device_ids=[rank],
+                            output_device=rank, find_unused_parameters=True)
     deform.train_setting(opt)
-    
-    scene = Scene(dataset, gaussians)
+
+    scene = Scene(dataset, gaussians, dataset_type=dataset_type)
     scene.dataset_init()
-    
     gaussians.training_setup(opt)
+
+    first_iter = 0
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        model_params, first_iter = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
+    iter_start = torch.cuda.Event(enable_timing=True)
+    iter_end = torch.cuda.Event(enable_timing=True)
 
-    use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
-    depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
-
-    viewpoint_stack = None
-    
     ema_loss_for_log = 0.0
-    ema_Ll1depth_for_log = 0.0
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training",
+                        disable=not is_main_process(), mininterval=10)
     first_iter += 1
+
     for iteration in range(first_iter, opt.iterations + 1):
-        if network_gui.conn == None:
+        if use_ddp:
+            dist.barrier()
+
+        # GUI viewer hook (optional)
+        if network_gui.conn is None:
             network_gui.try_connect()
-        while network_gui.conn != None:
+        while network_gui.conn is not None:
             try:
                 net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                (custom_cam, do_training, pipe.convert_SHs_python,
+                 pipe.compute_cov3D_python, keep_alive,
+                 scaling_modifer) = network_gui.receive()
+                if custom_cam is not None:
+                    net_image = render(
+                        custom_cam, gaussians, pipe, background,
+                        scaling_modifier=scaling_modifer,
+                        use_trained_exp=dataset.train_test_exp,
+                        separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                    net_image_bytes = memoryview(
+                        (torch.clamp(net_image, 0, 1) * 255)
+                        .byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+                if do_training and ((iteration < opt.iterations) or not keep_alive):
                     break
-            except Exception as e:
+            except Exception:
                 network_gui.conn = None
 
         iter_start.record()
-
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
+        # Increase SH degree every 1000 iterations
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
-        if iteration % 1000 == 0:
-            print("nums of gaussians:", gaussians.get_xyz.shape[0])
+            n_pts = gaussians.get_xyz.shape[0]
+            low_op = (gaussians.get_opacity.squeeze() < opt.min_opacity).sum().item()
+            print(f"[iter {iteration}] Gaussians: {n_pts} | "
+                  f"low-opacity (<{opt.min_opacity:.3f}): {low_op}")
 
-        # Pick a random Camera
+        # ---- Fetch one training sample ----
         try:
-            spectrum, tx_pos = next(scene.train_iter_dataset)
-
-        except:
+            data_input, data_label = next(scene.train_iter_dataset)
+        except StopIteration:
             scene.dataset_init()
-            spectrum, tx_pos = next(scene.train_iter_dataset)
+            data_input, data_label = next(scene.train_iter_dataset)
 
-        r_o = scene.r_o
-        gateway_orientation = scene.gateway_orientation 
-        R = torch.from_numpy(Rotation.from_quat(gateway_orientation).as_matrix()).float()
-        tx_pos = tx_pos.cuda()
-        viewpoint_cam = generate_new_cam(R, r_o)
-        N = gaussians.get_xyz.shape[0]
-        time_input = tx_pos.expand(N, -1)
-        d_xyz, d_rotation, d_scaling, d_signal = deform.step(gaussians.get_xyz.detach(), time_input)
+        if dataset_type == 'rfid':
+            R = torch.from_numpy(Rotation.from_quat(scene.gateway_orientation).as_matrix()).float()
+            r_o = scene.r_o
+            resolution = (360, 90)
+        elif dataset_type == 'ble':
+            R = torch.eye(3).float()
+            r_o = data_input[0, 3:6]    # gateway position for this sample
+            resolution = (36, 9)
 
-
-        # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
+        bg = torch.rand(3, device="cuda") if opt.random_background else background
 
-        bg = torch.rand((3), device="cuda") if opt.random_background else background
+        gt_spectrum = data_label.squeeze(0).cuda()
+        viewpoint_cam = generate_new_cam(R, r_o, dataset_type=dataset_type, resolution=resolution)
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg,d_xyz, d_rotation, d_scaling, d_signal, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        # if iteration%100==0:
-        #     print("radii.shape:", radii.shape)
-        #     print('radii:', radii)
-        
-        channel,height, width = image.shape
-        image_masked = image[0,:height, :]
-        render_image_show = image_masked.reshape( 1, 90, 360).cuda()
-        tb_writer.add_image('render-img', render_image_show, iteration)
-        # image = image[0,:height, :]
-        pred_spectrum_real = image[0,:height, :]
-        pred_spectrum_imag = image[1,:height, :]
-        pred_spectrum = pred_spectrum_real + 1j * pred_spectrum_imag
-        pred_spectrum = torch.abs(pred_spectrum)
-        image=pred_spectrum
-        
-        # Loss
-        gt_image = spectrum.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0).unsqueeze(0), gt_image.unsqueeze(0).unsqueeze(0))
-        else:
-            ssim_value = ssim(image, gt_image)
+        N = gaussians.get_xyz.shape[0]
+        # RFID: data_input is [1, 3] (tx only).
+        # BLE:  data_input is [1, 6] (tx_pos + gw_pos); only tx_pos goes to model.
+        time_input = data_input[:, :3].cuda().expand(N, -1)  # [N, 3]
+        d_rotation, d_scaling, d_signal = deform.step(
+            gaussians.get_xyz.detach(), time_input)
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg,
+                            d_rotation, d_scaling, d_signal,
+                            use_trained_exp=dataset.train_test_exp,
+                            separate_sh=SPARSE_ADAM_AVAILABLE)
+        image = render_pkg["render"]                    # [3, H, W]
+        viewspace_point_tensor = render_pkg["viewspace_points"]
+        visibility_filter = render_pkg["visibility_filter"]
+        radii = render_pkg["radii"]
 
-        # Depth regularization
-        Ll1depth_pure = 0.0
-        
-        Ll1depth = 0
+        if is_main_process() and tb_writer is not None:
+            tb_writer.add_image('render/spectrum', image[0].unsqueeze(0), iteration)
 
-        loss.backward()
 
+        if dataset_type == 'rfid':
+
+            # Treat channel 0 as real part and channel 1 as imaginary part; take magnitude as predicted spectrum.
+            pred_spectrum = torch.abs(image[0] + 1j * image[1])  # [H, W]
+
+            Ll1 = l2_loss(pred_spectrum, gt_spectrum)
+            if FUSED_SSIM_AVAILABLE:
+                ssim_value = fused_ssim(pred_spectrum.unsqueeze(0).unsqueeze(0),
+                                        gt_spectrum.unsqueeze(0).unsqueeze(0))
+            else:
+                ssim_value = skimage_ssim(
+                    pred_spectrum.detach().cpu().numpy(),
+                    gt_spectrum.detach().cpu().numpy(),
+                    data_range=1.0, channel_axis=None)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+        # ---- BLE: predict scalar RSSI (amplitude) ----
+        elif dataset_type == 'ble':
+            pred_rssi = torch.abs(torch.mean(image[0] + 1j * image[1], dim=(-1,-2)))
+            loss = l2_loss(pred_rssi, data_label.squeeze(0).cuda())
+
+        grad_accum_steps = getattr(opt, 'grad_accum_steps', 1)
+        (loss / grad_accum_steps).backward()
         iter_end.record()
 
         with torch.no_grad():
-            # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
-
+            ema_loss_for_log = 0.5 * loss.item() + 0.5 * ema_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.7f}, PredRSSI: {pred_rssi.item():.7f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
-            
-            tb_writer.add_scalar('train_loss', loss.item(), iteration)            
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+            if is_main_process() and tb_writer is not None:
+                tb_writer.add_scalar('train/loss', loss.item(), iteration)
+                tb_writer.add_scalar('train/num_gaussians',
+                                     gaussians.get_xyz.shape[0], iteration)
 
-            # training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
-            if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
+            if (iteration in saving_iterations) and is_main_process():
+                print(f"\n[ITER {iteration}] Saving Gaussians")
                 scene.save(iteration)
 
-            # Densification
+            # Gaussian densification and pruning
+            # Densification stats accumulate every step regardless of grad_accum_steps.
             if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                gaussians.max_radii2D[visibility_filter] = torch.max(
+                    gaussians.max_radii2D[visibility_filter],
+                    radii[visibility_filter])
+                gaussians.add_densification_stats(viewspace_point_tensor,
+                                                  visibility_filter)
+                if (iteration > opt.densify_from_iter
+                        and iteration % opt.densification_interval == 0):
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold, opt.min_opacity,
+                        scene.cameras_extent, size_threshold, radii)
+                if (iteration % opt.opacity_reset_interval == 0
+                        or (dataset.white_background
+                            and iteration == opt.densify_from_iter)):
                     gaussians.reset_opacity()
-
-            # Optimizer step
-            if iteration < opt.iterations:
+            # Optimizer step every grad_accum_steps iterations.
+            if iteration < opt.iterations and iteration % grad_accum_steps == 0:
                 gaussians.exposure_optimizer.step()
-                gaussians.exposure_optimizer.zero_grad(set_to_none = True)
-                
+                gaussians.exposure_optimizer.zero_grad(set_to_none=True)
                 gaussians.optimizer.step()
-                gaussians.update_learning_rate(iteration)
-                deform.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
-                deform.optimizer.zero_grad()
+                deform.optimizer.step()
+                deform.optimizer.zero_grad(set_to_none=True)
                 deform.update_learning_rate(iteration)
-            
 
+            if (iteration in checkpoint_iterations) and is_main_process():
+                print(f"\n[ITER {iteration}] Saving Checkpoint")
+                torch.save((gaussians.capture(), iteration),
+                           os.path.join(scene.model_path, f"chkpnt{iteration}.pth"))
 
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-           
-            if iteration in testing_iterations:
+            if iteration in testing_iterations and is_main_process():
+                _evaluate(scene, gaussians, deform, logdir, iteration,
+                          dataset_type, pipe, bg, logger)
                 torch.cuda.empty_cache()
-                
-                logger.info("Start evaluation")
-                iteration_path = os.path.join(logdir, 'pred_spectrum', str(iteration))
-                os.makedirs(iteration_path, exist_ok=True) 
-                full_path = os.path.join(logdir, str(iteration))
-                os.makedirs(full_path, exist_ok=True)
-                save_img_idx = 0
-                all_ssim = []
-                for test_input, test_label in scene.test_iter: 
-                    
-                    
-                    r_o = scene.r_o
-                    gateway_orientation = scene.gateway_orientation 
-                    R = torch.from_numpy(Rotation.from_quat(gateway_orientation).as_matrix()).float()
-                    tx_pos = test_label.cuda()
-                    viewpoint_cam = generate_new_cam(R, r_o)
-                    N = gaussians.get_xyz.shape[0]
-                    time_input = tx_pos.expand(N, -1)
-                    d_xyz, d_rotation, d_scaling, d_signal = deform.step(gaussians.get_xyz.detach(), time_input)
-                    # d_xyz, d_rotation, d_scaling, d_signal = deform.step(gaussians.get_xyz.detach(), tx_pos)
-                    
-                    
-            
-
-                    render_pkg = render(viewpoint_cam, gaussians, pipe, bg,d_xyz, d_rotation, d_scaling, d_signal)
-
-                    image = render_pkg["render"]
-                    channel,height, width = image.shape
-                    pred_spectrum_real = image[0,:height, :]
-                    pred_spectrum_imag = image[1,:height, :]
-                    pred_spectrum = pred_spectrum_real + 1j * pred_spectrum_imag
-                    pred_spectrum = torch.abs(pred_spectrum)
-
-                    ## save predicted spectrum
-                    pred_spectrum = pred_spectrum.detach().cpu().numpy()
-                    gt_spectrum = test_input.squeeze(0).detach().cpu().numpy()
- 
-                    
-                    pixel_error = np.mean(abs(pred_spectrum - gt_spectrum))
-                    ssim_i = ssim(pred_spectrum, gt_spectrum, data_range=1, multichannel=False)
-                    logger.info(
-                        "Spectrum {:d}, Mean pixel error = {:.6f}; SSIM = {:.6f}".format(save_img_idx, pixel_error,
-                                                                                        ssim_i))
-                    paint_spectrum_compare(pred_spectrum, gt_spectrum,
-                                        save_path=os.path.join(iteration_path,
-                                                                f'{save_img_idx}.png'))
-                    all_ssim.append(ssim_i)
-                    logger.info("Median SSIM is {:.6f}".format(np.median(all_ssim)))
-                    save_img_idx += 1
-                    np.savetxt(os.path.join(full_path, 'all_ssim.txt'), all_ssim, fmt='%.4f')
-
-                torch.cuda.empty_cache() 
 
 
+# ---------------------------------------------------------------------------
+# Evaluation helpers
+# ---------------------------------------------------------------------------
 
-def prepare_output_and_logger(args,time):    
+def _evaluate(scene, gaussians, deform, logdir, iteration,
+              dataset_type, pipe, bg, logger):
+    """Dispatch evaluation to the dataset-specific function."""
+    if logger is not None:
+        logger.info("Evaluation at iteration %d", iteration)
+
+    iteration_path = os.path.join(logdir, 'pred_spectrum', str(iteration))
+    result_path = os.path.join(logdir, str(iteration))
+    os.makedirs(iteration_path, exist_ok=True)
+    os.makedirs(result_path, exist_ok=True)
+
+    if dataset_type == 'rfid':
+        _evaluate_rfid(scene, gaussians, deform, pipe, bg,
+                       iteration_path, result_path, logger)
+    elif dataset_type == 'ble':
+        _evaluate_ble(scene, gaussians, deform, pipe, bg,
+                      result_path, logger)
+
+
+def _evaluate_rfid(scene, gaussians, deform, pipe, bg,
+                   iteration_path, result_path, logger):
+    """RFID evaluation: per-sample pixel error and SSIM."""
+    R = torch.from_numpy(
+        Rotation.from_quat(scene.gateway_orientation).as_matrix()).float()
+    viewpoint_cam = generate_new_cam(R, scene.r_o, resolution=(360, 90), dataset_type='rfid')
+    N = gaussians.get_xyz.shape[0]
+    all_ssim = []
+
+    for idx, (test_input, test_label) in enumerate(scene.test_iter):
+        tx_pos = test_input.cuda()                              # [1, 3]
+        time_input = tx_pos.expand(N, -1)
+        d_rotation, d_scaling, d_signal = deform.step(
+            gaussians.get_xyz.detach(), time_input)
+
+        image = render(viewpoint_cam, gaussians, pipe, bg,
+                       d_rotation, d_scaling, d_signal)["render"]
+
+        pred_spectrum = torch.abs(image[0] + 1j * image[1]).detach().cpu().numpy()
+        gt_spectrum = test_label.squeeze(0).detach().cpu().numpy()
+
+        pixel_error = np.mean(np.abs(pred_spectrum - gt_spectrum))
+        ssim_val = skimage_ssim(pred_spectrum, gt_spectrum,
+                                data_range=1.0, channel_axis=None)
+        all_ssim.append(ssim_val)
+
+        if logger is not None:
+            logger.info("Sample %d | pixel_error=%.6f | SSIM=%.6f",
+                        idx, pixel_error, ssim_val)
+        paint_spectrum_compare(pred_spectrum, gt_spectrum,
+                               save_path=os.path.join(iteration_path, f'{idx}.png'))
+
+    if logger is not None:
+        logger.info("Median SSIM: %.6f", np.median(all_ssim))
+    np.savetxt(os.path.join(result_path, 'all_ssim.txt'), all_ssim, fmt='%.4f')
+
+
+def _evaluate_ble(scene, gaussians, deform, pipe, bg, result_path, logger):
+    """BLE evaluation: Median AE and RMSE in dBm."""
+    R = torch.eye(3).float()
+    N = gaussians.get_xyz.shape[0]
+
+    all_errors_db, all_pred_db, all_gt_db = [], [], []
+
+    for test_input, test_label in scene.test_iter:
+        gw_pos = test_input[0, 3:6]                             # [3]
+        viewpoint_cam = generate_new_cam(R, gw_pos, resolution=(36, 9), dataset_type='ble')
+
+        # Only tx_pos (3-dim) goes to model; gw_pos is used for camera only.
+        time_input = test_input[:, :3].cuda().expand(N, -1)     # [N, 3]
+        d_rotation, d_scaling, d_signal = deform.step(
+            gaussians.get_xyz.detach(), time_input)
+
+        image = render(viewpoint_cam, gaussians, pipe, bg,
+                       d_rotation, d_scaling, d_signal)["render"]
+        pred_rssi = torch.abs(torch.mean(image[0] + 1j * image[1], dim=(-1,-2)))
+
+        pred_db = amplitude2rssi(pred_rssi.item())
+        gt_db = amplitude2rssi(test_label.item())
+        all_errors_db.append(abs(pred_db - gt_db))
+        all_pred_db.append(pred_db)
+        all_gt_db.append(gt_db)
+
+    med = np.median(all_errors_db)
+    rmse = np.sqrt(np.mean(np.array(all_errors_db) ** 2))
+
+    if logger is not None:
+        logger.info("BLE | Median AE: %.2f dB | RMSE: %.2f dB", med, rmse)
+
+    np.savetxt(os.path.join(result_path, 'ble_errors_db.txt'), all_errors_db, fmt='%.2f')
+    np.savetxt(os.path.join(result_path, 'ble_pred_db.txt'), all_pred_db, fmt='%.2f')
+    np.savetxt(os.path.join(result_path, 'ble_gt_db.txt'), all_gt_db, fmt='%.2f')
+    with open(os.path.join(result_path, 'ble_summary.txt'), 'w') as f:
+        f.write(f"Median AE: {med:.2f} dB\n")
+        f.write(f"RMSE:      {rmse:.2f} dB\n")
+        f.write(f"Samples:   {len(all_errors_db)}\n")
+
+
+# ---------------------------------------------------------------------------
+# Output and logger setup
+# ---------------------------------------------------------------------------
+
+def prepare_output_and_logger(args, time):
     if not args.model_path:
-        if os.getenv('OAR_JOB_ID'):
-            unique_str=os.getenv('OAR_JOB_ID')
-        else:
-            unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", time)
-        
-    # Set up output folder
-    print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok = True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
-
-    # Create Tensorboard writer
-    tb_writer = None
+    print(f"Output folder: {args.model_path}")
+    os.makedirs(args.model_path, exist_ok=True)
+    with open(os.path.join(args.model_path, "cfg_args"), 'w') as f:
+        f.write(str(Namespace(**vars(args))))
     if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
-    else:
-        print("Tensorboard not available: not logging progress")
-    return tb_writer
+        return SummaryWriter(args.model_path)
+    print("Tensorboard not available: progress will not be logged.")
+    return None
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
-    if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar('iter_time', elapsed, iteration)
 
-    # Report test and samples of training set
-    if iteration in testing_iterations:
-        torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
-
-        for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
-                psnr_test = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if train_test_exp:
-                        image = image[..., image.shape[-1] // 2:]
-                        gt_image = gt_image[..., gt_image.shape[-1] // 2:]
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-
-        if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-        torch.cuda.empty_cache()
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Set up command line argument parser
-    parser = ArgumentParser(description="Training script parameters")
+    parser = ArgumentParser(description="WRF-GS+ Training Script")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
     parser.add_argument('--ip', type=str, default="127.0.0.74")
-    parser.add_argument('--port', type=int, default=6074)
+    parser.add_argument('--port', type=int, default=8686)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[ 60000,100000,200000,400000,600000, 800000,1000000,1200000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000,60000,200000,300000,600000,1200000])
-    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument('--test_iterations', nargs="+", type=int, default=[])
+    parser.add_argument('--save_iterations', nargs="+", type=int, default=[])
+    parser.add_argument('--checkpoint_iterations', nargs="+", type=int, default=[])
+    parser.add_argument('--quiet', action='store_true')
     parser.add_argument('--disable_viewer', action='store_true', default=False)
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[7000, 30000, 60000, 200000, 300000, 600000,1200000])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument('--gpu', type=int, default=0)
-    
-    args = parser.parse_args(sys.argv[1:])
-    
-    args.save_iterations.append(args.iterations)
-    torch.cuda.set_device(args.gpu)
-    
-    print("Optimizing " + args.model_path)
+    parser.add_argument('--start_checkpoint', type=str, default=None)
+    parser.add_argument('--gpu', type=int, default=2)
+    parser.add_argument('--dataset_type', type=str, default='rfid',
+                        choices=['rfid', 'ble'])
+    parser.add_argument('--use_ddp', action='store_true', default=False)
+    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--world_size', type=int, default=1)
 
-    # Initialize system state (RNG)
+    args = parser.parse_args(sys.argv[1:])
+
+    # Dataset-specific iteration schedules (used when not provided via CLI)
+    if args.dataset_type == 'rfid':
+        if not args.test_iterations:
+            args.test_iterations = [10000, 20000, 50000, 100000, 150000, 200000]
+        if not args.save_iterations:
+            args.save_iterations = [50000, 100000, 150000, 200000]
+        if not args.checkpoint_iterations:
+            args.checkpoint_iterations = [100000, 200000]
+    elif args.dataset_type == 'ble':
+        if not args.test_iterations:
+            args.test_iterations = [5000, 10000, 50000, 100000, 200000, 500000, 1000000, 1500000, 2000000]
+        if not args.save_iterations:
+            args.save_iterations = [100000, 500000, 1000000, 1500000, 2000000]
+        if not args.checkpoint_iterations:
+            args.checkpoint_iterations = [100000, 500000, 1000000, 1500000, 2000000]
+
+    # DDP setup
+    if args.use_ddp:
+        local_rank = int(os.environ.get('LOCAL_RANK', args.local_rank))
+        world_size = int(os.environ.get('WORLD_SIZE', args.world_size))
+        setup_ddp(local_rank, world_size)
+    else:
+        torch.cuda.set_device(args.gpu)
+
     safe_state(args.quiet)
 
-    # Start GUI server, configure and run training
-    if not args.disable_viewer:
+    if not args.disable_viewer and not args.use_ddp:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
-    # All done
-    print("\nTraining complete.")
+    dataset_params = lp.extract(args)
+    opt_params = op.extract(args)
+    opt_params = OptimizationParams.apply_dataset_config(opt_params, args.dataset_type)
+    pipe_params = pp.extract(args)
+
+    # Always save at the final iteration
+    if opt_params.iterations not in args.save_iterations:
+        args.save_iterations.append(opt_params.iterations)
+
+    if is_main_process():
+        print(f"Dataset: {args.dataset_type} | "
+              f"Iterations: {opt_params.iterations} | "
+              f"Test at: {args.test_iterations}")
+
+    try:
+        training(dataset_params, opt_params, pipe_params,
+                 args.test_iterations, args.save_iterations,
+                 args.checkpoint_iterations, args.start_checkpoint,
+                 args.debug_from, args.dataset_type, args.use_ddp)
+    finally:
+        if args.use_ddp:
+            cleanup_ddp()
+
+    if is_main_process():
+        print("\nTraining complete.")

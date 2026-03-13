@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -131,3 +131,40 @@ def safe_state(silent):
     np.random.seed(0)
     torch.manual_seed(0)
     # torch.cuda.set_device(torch.device("cuda:0"))
+
+
+def normalize_dir(v: torch.Tensor) -> torch.Tensor:
+    """Normalize direction vectors along the last dimension."""
+    return torch.nn.functional.normalize(v, dim=-1)
+
+
+def try_embed_pluecker_ray(pts: torch.Tensor, view: torch.Tensor) -> torch.Tensor:
+    """
+    Embed a ray (point + direction) as a Plücker line in PGA multivector format
+    for use with GATr.  Only called when use_view=True (currently disabled).
+
+    A Plücker line through point p in direction d is represented as:
+        l = d1*e23 + d2*e31 + d3*e12 + m1*e01 + m2*e02 + m3*e03
+    where moment m = p × d.
+
+    GATr multivector layout (16 components):
+      idx: 0=scalar, 1=e0, 2=e1, 3=e2, 4=e3,
+           5=e01, 6=e02, 7=e03, 8=e12, 9=e13, 10=e23,
+           11=e012, 12=e013, 13=e023, 14=e123, 15=e0123
+
+    Args:
+        pts:  [..., 3]  points on the ray
+        view: [..., 3]  ray directions (normalized)
+
+    Returns:
+        [..., 16]  multivector
+    """
+    moment = torch.cross(pts, view, dim=-1)          # [..., 3]
+    mv = torch.zeros(*pts.shape[:-1], 16, device=pts.device, dtype=pts.dtype)
+    mv[..., 5]  = moment[..., 0]   # e01
+    mv[..., 6]  = moment[..., 1]   # e02
+    mv[..., 7]  = moment[..., 2]   # e03
+    mv[..., 8]  = view[..., 2]     # e12
+    mv[..., 9]  = -view[..., 1]    # e13  (e31 = -e13)
+    mv[..., 10] = view[..., 0]     # e23
+    return mv

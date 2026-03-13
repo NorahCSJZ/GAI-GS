@@ -156,11 +156,11 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     
-    def gaussian_init(self):
-        # 随机生成服从高斯分布的张量
-        fused_point_cloud = torch.randn((200000,3)).float().cuda()
+    def gaussian_init(self, num_points):
+        # Randomly initialize Gaussian positions from N(0, 20^2) in world space.
+        fused_point_cloud = torch.randn((num_points,3)).float().cuda()
         fused_point_cloud = (fused_point_cloud*20)
-        fused_color = RGB2SH(torch.rand((200000,3)).float().cuda())
+        fused_color = RGB2SH(torch.rand((num_points,3)).float().cuda())
 
 
         
