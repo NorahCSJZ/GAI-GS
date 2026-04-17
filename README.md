@@ -18,7 +18,7 @@ Create the conda environment:
 
 ```bash
 conda env create -f environment.yml
-conda activate wrfgsplus
+conda activate gaigs
 ```
 
 Install submodules/extensions:
@@ -27,26 +27,6 @@ Install submodules/extensions:
 pip install ./submodules/simple-knn
 pip install ./submodules/diff-gaussian-rasterization
 pip install ./submodules/fused-ssim
-```
-
-## Data
-
-The code currently supports:
-
-- `rfid` dataset mode (default data root in code: `./RFID/s23`)
-
-## Training
-
-### Single-GPU
-
-```bash
-python train.py --dataset_type rfid --gpu 0
-```
-
-### DDP (multi-GPU)
-
-```bash
-bash run_ddp.sh 2
 ```
 
 ## Citation
