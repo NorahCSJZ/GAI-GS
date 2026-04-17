@@ -29,6 +29,11 @@ pip install ./submodules/diff-gaussian-rasterization
 pip install ./submodules/fused-ssim
 ```
 
+## Figure Correction
+
+The original CDF-SSIM figure in the paper contains a plotting error.
+The corrected figure is available here: [Corrected CDF-SSIM figure](assets/cdf2ssim_corrected.pdf).
+
 ## Citation
 
 If you find this repository useful, please cite our CVPR 2026 poster:
