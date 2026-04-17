@@ -1,6 +1,6 @@
 # CVPR 2026 Poster: A Geometric Algebra-Informed 3D Gaussian Splatting Framework for Wireless Scene Representation
 
-This repository contains the code for the CVPR 2026 poster:
+This repository contains the basic code for the CVPR 2026 poster:
 
 **A Geometric Algebra-Informed 3D Gaussian Splatting Framework for Wireless Scene Representation**  
 *CVPR 2026 Poster*
