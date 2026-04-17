@@ -173,12 +173,9 @@ def training(dataset, opt, pipe, testing_iterations, checkpoint,
                 channel_axis=None,
             )
         loss = (1.0 - opt.lambda_dssim) * ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        if d_attenuation is not None:
-            loss = loss + 0.02 * torch.norm(d_attenuation, p=2)
-
         lambda_delta = getattr(opt, 'lambda_delta', 0.0)
-        if lambda_delta > 0.0 and d_attenuation is not None:
-            loss = loss + lambda_delta * torch.mean(d_attenuation ** 2)
+        if d_attenuation is not None and lambda_delta > 0.0:
+            loss = loss + lambda_delta * torch.norm(d_attenuation, p=2)
 
         grad_accum_steps = getattr(opt, 'grad_accum_steps', 1)
         (loss / grad_accum_steps).backward()
